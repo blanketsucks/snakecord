@@ -1,9 +1,11 @@
 import enum
+import json
 import platform
+import time
 
-from wsaio import taskify
+from wsaio import WebSocketFrame, WebSocketOpcode, taskify
 
-from .base import BaseConnection, Heartbeater, WebSocketResponse
+from .base import BaseConnection, WebSocketMessage
 
 
 class ShardOpcode(enum.IntEnum):
@@ -22,19 +24,15 @@ class ShardOpcode(enum.IntEnum):
 
 
 class Shard(BaseConnection):
-    ENDPOINT = 'wss://gateway.discord.gg?v=8'
-
-    def __init__(self, manager, id: int):
-        super().__init__(manager)
-        self.id = id
-
-    @property
-    def heartbeat_payload(self):
-        payload = {
+    HEARTBEAT_PAYLOAD = WebSocketFrame(
+        opcode=WebSocketOpcode.TEXT,
+        data=json.dumps({
             'op': ShardOpcode.HEARTBEAT,
             'd': None
-        }
-        return payload
+        }).encode()
+    ).encode(masked=True)
+
+    ENDPOINT = 'wss://gateway.discord.gg?v=8'
 
     async def identify(self):
         payload = {
@@ -52,24 +50,26 @@ class Shard(BaseConnection):
         await self.send_json(payload)
 
     @taskify
-    async def ws_ping_received(self, data: bytes):
-        await self.send_pong(data)
+    async def ws_text_received(self, data):
+        msg = WebSocketMessage.unmarshal(data)
 
-    @taskify
-    async def ws_text_received(self, data: str) -> None:
-        response = WebSocketResponse.unmarshal(data)
-        # response.opcode = ShardOpcode(response.opcode)
+        if msg.opcode == ShardOpcode.DISPATCH:
+            self.manager.dispatch(msg.event_name, self, msg.data)
 
-        if response.opcode == ShardOpcode.DISPATCH:
-            self.manager.dispatch(response.name, self, response.data)
-        if response.opcode == ShardOpcode.HELLO:
-            self.heartbeater = Heartbeater(
-                self, loop=self.loop,
-                delay=response.data['heartbeat_interval'] / 1000)
-            self.heartbeater.start()
+        elif msg.opcode == ShardOpcode.HELLO:
+            self.heartbeat_interval = (
+                msg.data['heartbeat_interval'] / 1000
+            )
+            await self.manager.connection_worker.wakeup()
             await self.identify()
-        elif response.opcode == ShardOpcode.HEARTBEAT:
+
+        elif msg.opcode == ShardOpcode.HEARTBEAT:
             self.send_heartbeat()
+
+        elif msg.opcode == ShardOpcode.HEARTBEAT_ACK:
+            self.heartbeats_acked += 1
+            self.heartbeat_last_acked = time.perf_counter()
+            await self.manager.connection_worker.wakeup()
 
     async def connect(self, *args, **kwargs):
         await super().connect(self.ENDPOINT, *args, **kwargs)

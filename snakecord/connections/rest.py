@@ -1,19 +1,6 @@
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import types
-from datetime import datetime, timedelta
-from typing import (Any, Dict, Generator, Optional,
-                    TYPE_CHECKING, Tuple, TypeVar)
-
-import aiohttp
-
-T = TypeVar('T')
-R = TypeVar('R', bound='RestFuture')
-
-if TYPE_CHECKING:
-    from ..clients.user.manager import UserClientManager
+from typing import Any, Dict, Tuple
 
 
 class HTTPError(Exception):
@@ -32,7 +19,7 @@ class HTTPEndpoint:
         self.params = params
         self.json = json
 
-    def request(self, *, session: RestSession,
+    def request(self, *, session,
                 fmt: Dict[str, Any] = {}, params=None,
                 json=None, **kwargs):
         if params is not None:
@@ -40,10 +27,6 @@ class HTTPEndpoint:
 
         if json is not None:
             json = {k: v for k, v in json.items() if k in self.json}
-
-        throttler = session.throttler_for(self, fmt)
-        return throttler.submit(self.method, self.url % fmt,
-                                params=params, json=json, **kwargs)
 
 # TODO: Form params, arrays of json objects
 
@@ -650,192 +633,10 @@ get_gateway_bot = HTTPEndpoint(
 )
 
 
-class RestFuture(asyncio.Future[T]):
-    def __init__(self, *args, **kwargs):
-        self.process_response = kwargs.pop('process_response', None)
-        super().__init__(*args, **kwargs)
-
-    def __await__(self: R) -> Generator[None, None, R]:  # type: ignore
-        yield
-        return self  # This is equivalent to asyncio.sleep(0), it gives
-        # the RequestThrottler a chance to run the request without
-        # waiting on the request to actually be finished. This
-        # allows us to have "parallel" execution of requests
-        # without entirely broken logic
-        # (at worst the request happening after the coroutine is done).
-        # Example:
-        # ```py
-        # async def something(channel):
-        #      while True:
-        #          channel.send("Hello")
-        # ```
-        # You'd expect it to send Hello forever but of course the script
-        # will hang because we never yield in the while loop.
-
-    async def wait(self) -> T:
-        return await types.coroutine(
-            super().__await__)()  # type: ignore
-
-
-class RequestThrottler:
-    def __init__(self, session: RestSession, endpoint):
-        self.session = session
-        self.endpoint = endpoint
-
-        self.limit: Optional[int] = None
-        self.remaining: Optional[datetime] = None
-        self.reset: Optional[datetime] = None
-        self.reset_after: Optional[float] = None
-        self.bucket = None
-
-        self._made_initial_request = False
-
-        self._queue: asyncio.Queue[
-            Tuple[asyncio.Future, Tuple[Any, ...], Dict[str, Any]]
-        ] = asyncio.Queue()
-
-        self._lock = asyncio.Lock()
-        self._running = False
-
-    @contextlib.asynccontextmanager
-    async def _enter(self):
-        await self._lock.acquire()
-        assert not self._running
-        self._running = True
-        try:
-            yield
-        finally:
-            self._running = False
-            self._lock.release()
-
-    async def _request(self, future, *args, **kwargs) -> None:
-        response = await self.session.request(*args, **kwargs)
-
-        data = await response.json()
-        if future.process_response is not None:
-            data = future.process_response(data)
-
-        limit = response.headers.get('X-RateLimit-Limit')
-        if limit is not None:
-            self.limit = int(limit)
-
-        remaining = response.headers.get('X-RateLimit-Remaining')
-        if remaining is not None:
-            remaining = int(remaining)
-            if self.remaining is None or remaining < self.remaining:
-                # if remaining > self.remaining then we've already processed
-                # a newer response (or keys are conflicting,
-                # or a foriegn client is making requests). Overwriting the
-                # attributes with this data would make everything stail
-                # and unhelpful
-                print(f'SETTING REMAINING TO {remaining}')
-                self.remaining = remaining
-
-                if 'reactions' in self.endpoint.url:
-                    # the headers lie for reaction endpoints
-                    # https://github.com/discordapp/discord-api-docs/issues/182
-                    # thanks discord.js
-                    self.reset = (datetime.utcnow()
-                                  + timedelta(milliseconds=250))
-                    self.reset_after = 250 / 1000
-                else:
-                    reset = response.headers.get('X-RateLimit-Reset')
-                    if reset is not None:
-                        self.reset = datetime.utcfromtimestamp(float(reset))
-
-                    reset_after = response.headers.get(
-                        'X-RateLimit-Reset-After'
-                    )
-                    if reset_after is not None:
-                        self.reset_after = float(reset_after)
-
-                bucket = response.headers.get('X-RateLimit-Bucket')
-                if bucket is not None:
-                    self.bucket = bucket
-                    print(f'BUCKET {self.bucket}')
-
-        if response.status >= 400:
-            print(response.status)
-            return future.set_exception(HTTPError(response, data))
-
-        future.set_result(data)
-
-    async def _run_requests(self):
-        async with self._enter():
-            if not self._made_initial_request:
-                future, args, kwargs = self._queue.get_nowait()
-                await self._request(future, *args, **kwargs)
-                self._made_initial_request = True
-
-            while self.remaining:
-                await asyncio.sleep(0)  # This is needed so that other Tasks
-                # get a chance to queue up requests. Removing this could lead
-                # to some weird behaviour.
-
-                coros = []
-                for _ in range(self.remaining):
-                    try:
-                        future, args, kwargs = self._queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        if coros:
-                            break
-                        return
-
-                    coros.append(self._request(future, *args, **kwargs))
-
-                print(f'RUNNING {len(coros)} COROUTINES')
-                await asyncio.gather(*coros)
-
-                if self.remaining == 0:
-                    print(f'SLEEPING FOR {self.reset_after}')
-                    await asyncio.sleep(self.reset_after)
-                    self.remaining = self.limit
-
-    def submit(self, *args, **kwargs):
-        # Please don't use this in a while loop
-        # without waiting, you'll just run out of memory eventually.
-        # (14 messages sent with 21,502 requests submitted
-        # and it only gets worse)
-        process_response = kwargs.pop('process_response', None)
-        future = RestFuture(loop=self.session.loop,
-                            process_response=process_response)
-        self._queue.put_nowait((future, args, kwargs))
-
-        if not self._running:
-            self.session.loop.create_task(
-                self._run_requests())
-
-        return future
-
-
 class RestSession:
-    def __init__(self, manager: UserClientManager) -> None:
-        self.manager = manager
-        self.loop = manager.loop
-        self.token = manager.token
-        self.session = aiohttp.ClientSession(loop=self.loop)
-        self._throttlers: Dict[str, RequestThrottler] = {}
+    def __init__(*args, **kwargs):
+        pass
 
-    def key_for(self, method, url, fmt):
-        major_params = ('channel_id', 'guild_id', 'webhook_id',
-                        'webhook_token')
 
-        params = ':'.join(str(fmt.get(param)) for param in major_params)
-        return f'{method}:{url}:{params}'
-
-    def throttler_for(self, endpoint: HTTPEndpoint, fmt: Dict[str, Any]):
-        key = self.key_for(endpoint.method, endpoint.url, fmt)
-        throttler = self._throttlers.get(key)
-
-        if throttler is None:
-            throttler = RequestThrottler(self, endpoint)
-            self._throttlers[key] = throttler
-
-        return throttler
-
-    async def request(self, *args, **kwargs):
-        headers = kwargs.pop('headers', {})
-        headers.update({
-            'Authorization': f'Bot {self.token}'
-        })
-        return await self.session.request(*args, **kwargs, headers=headers)
+class RestFuture:
+    pass

@@ -44,8 +44,9 @@ class BaseSnowflakeMapping(BaseMapping):
 Mapping = BaseMapping.for_type(dict)
 SnowflakeMapping = BaseSnowflakeMapping.for_type(dict)
 WeakValueMapping = BaseMapping.for_type(weakref.WeakValueDictionary)
-WeakValueSnowflakeMapping = SnowflakeMapping.for_type(
-    weakref.WeakValueDictionary)
+WeakValueSnowflakeMapping = (
+    SnowflakeMapping.for_type(weakref.WeakValueDictionary)
+)
 
 
 class BaseState:
@@ -55,8 +56,8 @@ class BaseState:
     __replace__ = True
 
     def __init__(self, *, manager: BaseManager) -> None:
-        self._items = self.__container__()
-        self._recycle_bin = self.__recycled_container__()
+        self._items: BaseMapping = self.__container__()
+        self._recycle_bin: BaseMapping = self.__recycled_container__()
         self.manager = manager
 
     def __repr__(self) -> str:
@@ -87,10 +88,11 @@ class BaseState:
         if (
             self.__maxsize__ != 0
             and len(self) >= self.__maxsize__
-            and self.__replace__
         ):
-            val = next(iter(reversed(self.values())))
-            val.uncache()
+            if not self.__replace__:
+                return False
+
+            self.popitem().uncache()
 
         self._items.__setitem__(key, value)
         return True
@@ -127,6 +129,9 @@ class BaseState:
 
     def pop(self, *args, **kwargs):
         return self._items.pop(*args, **kwargs)
+
+    def popitem(self, *args, **kwargs):
+        self._items.popitem(*args, **kwargs)
 
     def find(self, func):
         for item in self:

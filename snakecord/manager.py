@@ -1,4 +1,8 @@
+from typing import Optional, Type
+
+from .connections.base import BaseConnection
 from .connections.rest import RestSession
+from .connections.worker import ConnectionWorker
 from .states.channel import ChannelState, GuildChannelState
 from .states.emoji import GuildEmojiState
 from .states.guild import GuildState
@@ -24,57 +28,84 @@ class BaseManager(EventDispatcher):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.users = self.__user_state_clsas__(manager=self)
         self.rest = self.__rest_session_class__(manager=self)
+        self.users = self.__user_state_clsas__(manager=self)
         self.guilds = self.__guild_state_class__(manager=self)
         self.channels = self.__channel_state_class__(manager=self)
 
+        self.connections = {}
+        self.connection_worker: Optional[ConnectionWorker] = None
+
     @classmethod
-    def set_rest_session_class(cls, klass) -> None:
+    def set_rest_session_class(cls, klass) -> type:
         assert issubclass(klass, RestSession)
         cls.__rest_session_class__ = klass
+        return klass
 
     @classmethod
-    def set_channel_state_class(cls, klass) -> None:
+    def set_channel_state_class(cls, klass) -> type:
         assert issubclass(klass, ChannelState)
         cls.__channel_state_class__ = klass
+        return klass
 
     @classmethod
-    def set_guild_channel_state_class(cls, klass) -> None:
+    def set_guild_channel_state_class(cls, klass) -> type:
         assert issubclass(klass, GuildChannelState)
         cls.__guild_channel_state_class__ = klass
+        return klass
 
     @classmethod
-    def set_guild_emoji_state_class(cls, klass) -> None:
+    def set_guild_emoji_state_class(cls, klass) -> type:
         assert issubclass(klass, GuildEmojiState)
         cls.__guild_emoji_state_class__ = klass
+        return klass
 
     @classmethod
-    def set_guild_state_class(cls, klass) -> None:
+    def set_guild_state_class(cls, klass) -> type:
         assert issubclass(klass, GuildState)
         cls.__guild_state_class__ = klass
+        return klass
 
     @classmethod
-    def set_guild_member_state_class(cls, klass) -> None:
+    def set_guild_member_state_class(cls, klass) -> type:
         assert issubclass(klass, GuildMemberState)
         cls.__guild_member_state_class__ = klass
+        return klass
 
     @classmethod
-    def set_channel_message_state_class(cls, klass) -> None:
+    def set_channel_message_state_class(cls, klass) -> type:
         assert issubclass(klass, ChannelMessageState)
         cls.__channel_message_state_class__ = klass
+        return klass
 
     @classmethod
-    def set_message_reaction_state_class(cls, klass) -> None:
+    def set_message_reaction_state_class(cls, klass) -> type:
         assert issubclass(klass, MessageReactionState)
         cls.__message_reaction_state_class__ = klass
+        return klass
 
     @classmethod
-    def set_guild_role_state_class(cls, klass) -> None:
+    def set_guild_role_state_class(cls, klass) -> type:
         assert issubclass(klass, RoleState)
         cls.__guild_role_state_class__ = klass
+        return klass
 
     @classmethod
-    def set_user_state_class(cls, klass) -> None:
+    def set_user_state_class(cls, klass) -> type:
         assert issubclass(klass, UserState)
         cls.__user_state_clsas__ = klass
+        return klass
+
+    async def create_connection(self, klass: Type[BaseConnection],
+                                *args, **kwargs) -> BaseConnection:
+        if self.connection_worker is None:
+            self.connection_worker = ConnectionWorker(manager=self)
+            self.connection_worker.start()
+
+        connection = klass(manager=self)
+        await connection.connect(*args, **kwargs)
+
+        sock = connection.transport.get_extra_info('socket')
+        self.connections[sock.fileno()] = connection
+
+        return connection

@@ -360,7 +360,5 @@ class UserClientManager(BaseManager):
 
     async def start(self, *args, **kwargs):
         for i in self.shard_range:
-            self.shards[i] = Shard(self, i)
-
-        for shard in self.shards.values():
-            await shard.connect(*args, **kwargs)
+            self.shards[i] = await self.create_connection(
+                Shard, *args, **kwargs)

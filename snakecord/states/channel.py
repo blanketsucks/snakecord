@@ -74,7 +74,7 @@ class ChannelState(BaseState):
     async def fetch(self, channel_id):
         channel_id = Snowflake.try_snowflake(channel_id)
         data = await rest.get_channel.request(
-            session=self.manager.rest, fmt={'channel_id': channel_id}).wait()
+            session=self.manager.rest, fmt={'channel_id': channel_id})
         return self.append(data)
 
 
@@ -88,29 +88,3 @@ class GuildChannelState(BaseSubState):
     def __related__(self, item):
         return (isinstance(item, channels.GuildChannel)
                 and item.guild == self.guild)
-
-    def create(
-        self,
-        *,
-        name: str,
-        type: Union[int, ChannelType],
-        **fields
-    ) -> rest.RestFuture[dict]:
-        return rest.create_guild_channel.request(
-            session=self.superstate.manager.rest,
-            fmt={'guild_id': self.guild.id},
-            json={'name': name, 'type': type, **fields}
-        )
-
-    def create_text(self, *, name: str, **fields) -> rest.RestFuture[dict]:
-        return self.create(name=name, type=ChannelType.GUILD_TEXT, **fields)
-
-    def create_news(self, *, name: str, **fields) -> rest.RestFuture[dict]:
-        return self.create(name=name, type=ChannelType.GUILD_NEWS, **fields)
-
-    def create_category(self, *, name: str, **fields) -> rest.RestFuture[dict]:
-        return self.create(
-            name=name, type=ChannelType.GUILD_CATEGORY, **fields)
-
-    def create_voice(self, *, name: str, **fields) -> rest.RestFuture[dict]:
-        return self.create(name=name, type=ChannelType.GUILD_VOICE, **fields)
